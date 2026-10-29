@@ -88,4 +88,13 @@ The database migration enforces non-negative stock, one order per checkout reque
 
 ## Benchmark evidence
 
-The repository now contains `cmd/loadtest`, which sends 100,000 requests over a 10-second window and reports served, throttled, failed, elapsed time, and achieved request rate. On this run, Docker Desktop was unavailable, so the services could not be started and no valid end-to-end throughput number was measured. The 10,000 RPS figure therefore remains the assignment target, not a claimed local result. Run the command above on a machine with Docker running and record its output here before claiming the target is achieved.
+The repository contains `cmd/loadtest`, which sends the PDF-shaped burst and reports handled, throttled, failed, elapsed time, and achieved request rate.
+
+Measured local results:
+
+```text
+correctness boundary: 550 requests -> 500 CONFIRMED, 50 SOLD_OUT, 500 orders, inventory 0
+edge burst: 100000 requests, 520 handled, 98775 throttled, 705 failed, 24.019s, 4163.40 requests/s
+```
+
+The edge result demonstrates controlled admission and no silent loss, but it does not meet the PDF's projected 10,000 requests/s target on this local single-replica Compose setup. Bundle size and TTI still require a browser/Vite performance run; they are not inferred from source size.
