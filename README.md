@@ -1,82 +1,108 @@
 # Flash Sale System
 
-## Executive summary
+## Overview
 
-This repository implements the flash-sale take-home for **500 smartphones**, launching at **8:00 PM**, with more than **100,000 checkout attempts during the launch spike**.
+This repository implements a flash-sale checkout system:
 
-The design separates fast request admission from durable inventory settlement:
+- 500 smartphones become available at 8:00 PM.
+- More than 100,000 checkout requests can arrive during the first ten seconds.
+- At most 500 orders can reach `CONFIRMED`.
+- Inventory cannot become negative.
+- Accepted checkout requests are durable and idempotent.
 
-- **Go `net/http`** handles stateless HTTP requests.
-- **NGINX** serves static assets and applies edge rate limiting.
-- **Redis** performs atomic rate limiting/admission and caches status.
-- **PostgreSQL** is the only durable authority for inventory, idempotency, orders, and checkout state.
-- **RabbitMQ** is the one durable business queue.
-- **Go workers** settle inventory asynchronously.
-- **Polling** is the baseline status mechanism; **SSE** is an optional enhancement.
+The local deployment launched 100,000 requests through NGINX, accepted 2,000, throttled 98,000 with controlled `429` responses, produced no connection or server failures, and confirmed exactly 500 orders.
 
-The hard invariant is:
+## Contents
 
-> Confirmed orders must never exceed 500, and inventory must never become negative.
+- [Checkout State Machine](#checkout-state-machine)
+- [Design Decisions](#design-decisions)
+- [Architecture](#architecture)
+- [Request Flow](#request-flow)
+- [State and API Contracts](#state-and-api-contracts)
+- [Autoscaling and Routing](#autoscaling-and-routing)
+- [Measured Results](#measured-results)
+  - [Load Test Method](#load-test-method)
+  - [Correctness](#correctness)
+  - [Launch Burst](#launch-burst)
+  - [Frontend](#frontend)
+- [Run](#run)
 
-## PDF requirement mapping
+## Checkout State Machine
 
-| Requirement | Implementation | Evidence |
+Every accepted request follows one durable state path:
+
+```text
+QUEUED -> PROCESSING -> CONFIRMED
+                     -> SOLD_OUT
+                     -> FAILED
+```
+
+`QUEUED` means RabbitMQ accepted the job. `PROCESSING` is owned by a PostgreSQL lease and processing token. `CONFIRMED`, `SOLD_OUT`, and `FAILED` are terminal states. Duplicate requests and redelivered messages resolve to the same request state and cannot create a second order.
+
+## Design Decisions
+
+| Decision | Choice | Reason |
 |---|---|---|
-| 500 physical units | PostgreSQL inventory row seeded to 500 | Correctness run produced exactly 500 orders |
-| Launch at 8:00 PM | Server-authoritative sale timestamp | Pre-launch unit test and server-time endpoint |
-| 100,000-request spike | NGINX, Redis admission, RabbitMQ buffering, bounded workers | 100,000-request live benchmark recorded below |
-| No overselling | Atomic PostgreSQL conditional decrement | 500 confirmed, 50 sold out, stock 0 |
-| Prevent duplicate clicks | Client idempotency key plus database uniqueness | Same-key smoke test returned one tracking ID |
-| Async processing | Transactional outbox and RabbitMQ worker | Accepted requests return `202`; worker settles later |
-| Frontend responsiveness | Small static page, leading-edge button lock, polling/SSE | Served asset and browser timing measurements |
-| Rate limiting | NGINX and Redis Lua token bucket | Edge benchmark reports throttled requests separately |
-| Database consistency | ACID transaction and non-negative constraint | PostgreSQL audit query and concurrency run |
+| API | Go `net/http` | Small stateless handlers and predictable concurrency. |
+| Edge | NGINX | Static delivery, request limits, rate limiting, least-connection routing, and local load-balancer behavior. |
+| Durable state | PostgreSQL 16 | ACID transactions, unique idempotency keys, and atomic inventory settlement. |
+| Fast coordination | Redis 7 | Atomic Lua admission, rate limits, short-lived tickets, status cache, and fanout. Redis is not the order authority. |
+| Business queue | RabbitMQ quorum queue | Durable messages, publisher confirms, manual acknowledgements, retries, and dead-lettering. |
+| Status | HTTP polling by default, SSE optional | Polling keeps the client path simple; SSE is separately scalable through Redis fanout. |
+| Inventory operation | Conditional SQL decrement | One database operation prevents lost updates and negative stock. |
+| Scaling | Four pre-scaled API replicas plus Go autoscaler | The launch time is known; pre-scaling handles the first burst and autoscaling handles pressure and recovery. |
+
+Pessimistic row locks would serialize the hot inventory row and increase lock waits. Optimistic version checks would require retries under the same contention. The selected conditional update lets PostgreSQL perform the lock and decrement atomically. Redis Lua provides the same atomicity for admission, but Redis cannot decide final ownership of inventory.
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    Browser[Browser] -->|static assets| Edge[NGINX edge]
-    Edge -->|cache hit| Browser
-    Edge -->|POST checkout| API[Stateless Go API]
-    API --> Time{Server sale time valid?}
-    Time -->|before launch| NotLive[403 NOT_LIVE\nno mutation]
-    Time -->|live| RedisGate[Redis Lua rate limit\nand bounded admission]
-    RedisGate -->|rejected| Limited[429 Retry-After]
-    RedisGate -->|admitted| Idem[PostgreSQL atomic\nidempotency insert-or-read]
-    Idem -->|same key| Existing[Return existing state]
-    Idem -->|new key| Accepted[Commit request + outbox]
-    Accepted --> Response[202 + tracking ID]
-    Accepted --> Relay[Outbox relay]
-    Relay --> Queue[RabbitMQ durable quorum queue]
-    Queue --> Worker[Go worker\nmanual ack + bounded prefetch]
-    Worker --> Claim[DB processing lease/token]
-    Claim --> Inventory[Atomic UPDATE inventory\nWHERE available >= 1]
-    Inventory -->|one row| Confirmed[Insert unique order\nCONFIRMED]
-    Inventory -->|zero rows| SoldOut[SOLD_OUT]
-    Confirmed --> Status[Terminal status transaction]
-    SoldOut --> Status
-    Status --> Cache[Redis versioned status cache]
-    Status --> Fanout[Redis status fanout]
-    Browser -->|GET status or SSE| StatusAPI[Status API/SSE]
-    StatusAPI --> Cache
-    Cache -->|miss| PostgreSQL[(PostgreSQL)]
-    StatusAPI --> Browser
+<p align="center">
+  <img src="./docs/architecture-diagram.png" alt="Flash-sale architecture" />
+</p>
+
+The diagram is a compact overview. Checkout and status requests both traverse the NGINX edge before reaching the API; status reads then use Redis first and PostgreSQL on a cache miss.
+
+## Request Flow
+
+1. The browser loads static assets through NGINX. Immutable cache headers make the route CDN-ready and keep static traffic away from checkout traffic. `/api/v1/time` returns the server sale timestamp. The countdown is display-only.
+
+2. Before the sale opens, the Buy button is disabled. At the first valid click the browser disables it immediately, creates one UUID idempotency key, and stores the key and tracking ID in `sessionStorage` for refresh and retry recovery.
+
+3. `POST /api/v1/checkout` carries `Idempotency-Key`, `X-User-ID`, product ID, and quantity. NGINX applies request-size limits and edge rate limiting. Excess traffic receives `429 Retry-After`.
+
+4. The API checks the server sale window before Redis. Redis Lua atomically validates the sale window, consumes rate-limit capacity, enforces the bounded admission counter, and creates a short-lived idempotency hint. Admission is not an order and is not a second durable queue.
+
+5. For a new key, the API publishes a persistent RabbitMQ message and waits for publisher confirmation. Only then does it return `202 Accepted` with a tracking ID and status URL. If publishing fails, it returns `503` and releases the temporary admission ticket. A same-key retry returns the original tracking ID; a different payload returns `409 Conflict`.
+
+6. A worker consumes the durable message. It inserts the PostgreSQL request row with `ON CONFLICT`, compares the request fingerprint, claims `QUEUED -> PROCESSING` with a processing token and lease, and ignores duplicate terminal work.
+
+7. The settlement transaction is:
+
+```sql
+BEGIN;
+
+UPDATE inventory
+SET available = available - 1
+WHERE product_id = $1 AND available > 0;
+
+-- one affected row: insert unique order and mark CONFIRMED
+-- zero affected rows: mark SOLD_OUT
+-- both paths write terminal result and status outbox event
+
+COMMIT;
 ```
 
-## Sequential request flow
+The RabbitMQ message is acknowledged only after this commit. A worker crash before acknowledgement causes redelivery. A crash after commit is harmless because request and order uniqueness constraints make the retry a no-op. Expired leases can be reclaimed and stale processing tokens cannot commit.
 
-### 1. Page load
+8. The status event updates Redis cache and fanout. The browser polls with exponential backoff and jitter. SSE sends the cached initial state, event IDs, fanout updates, and heartbeats; an SSE error closes the stream and falls back to polling. Terminal states stop both mechanisms.
 
-The browser requests immutable static assets through NGINX. NGINX is the local stand-in for a CDN and production WAF/load balancer. Static traffic is separated from dynamic checkout traffic and served with compression and cache headers.
+## State and API Contracts
 
-The browser calls `/api/v1/time` to obtain the server's sale timestamp. The countdown is display-only; the client clock cannot authorize a purchase.
-
-### 2. First click
-
-The browser immediately disables the Buy button and creates one UUID idempotency key for that logical checkout attempt. The key and tracking ID are stored in `sessionStorage` so a refresh or network retry can resume the same attempt.
-
-The request is:
+```text
+QUEUED -> PROCESSING -> CONFIRMED
+                     -> SOLD_OUT
+                     -> FAILED
+```
 
 ```http
 POST /api/v1/checkout
@@ -87,160 +113,88 @@ Content-Type: application/json
 {"product_id":"phone-500","quantity":1}
 ```
 
-The client never displays purchase confirmation optimistically.
-
-### 3. Edge admission
-
-NGINX applies request-size limits, compression, static caching, and per-IP rate limiting. Excess traffic receives a controlled `429` with `Retry-After`; it is not counted as silently dropped.
-
-The Go API then executes Redis Lua admission logic:
-
-- token-bucket rate limit;
-- bounded short-lived admission counter;
-- TTL-based recovery after abandoned requests.
-
-Admission is not a business queue and does not confirm ownership of inventory.
-
-### 4. Sale-window enforcement
-
-The API checks server time before Redis admission and before any database mutation. A pre-launch request returns:
-
-```json
-{"status":"NOT_LIVE","sale_start":"...","server_time":"..."}
-```
-
-It creates no request row, order, outbox event, queue message, Redis reservation, or inventory mutation.
-
-### 5. Durable idempotency acceptance
-
-The API uses PostgreSQL `INSERT ... ON CONFLICT` for `(user_id, idempotency_key)`. Each request stores a fingerprint of its input.
-
-- New key: create `QUEUED` request and outbox event in one transaction.
-- Same key and same fingerprint: return the existing tracking ID/state.
-- Same key and different fingerprint: return `409 Conflict`.
-
-The API returns `202 Accepted` only after the request row and outbox row commit. `202` means accepted for asynchronous processing, not confirmed purchase.
-
-### 6. Transactional outbox and RabbitMQ
-
-The relay publishes committed outbox rows to the durable `checkout.process` quorum queue using persistent messages and publisher confirms. It marks an outbox row published only after confirmation.
-
-The system assumes at-least-once delivery. Relay retries and duplicate messages are expected; worker/database idempotency makes them safe.
-
-### 7. Worker ownership
-
-The worker claims a request using a conditional PostgreSQL update:
-
-```text
-QUEUED -> PROCESSING
-processing_token = random token
-lease_until = now + lease duration
-```
-
-Expired leases can be reclaimed. A stale worker cannot complete a request because terminal updates verify the processing token. RabbitMQ is acknowledged only after the durable terminal transaction commits.
-
-### 8. Inventory settlement
-
-The worker runs one short PostgreSQL transaction:
-
-```sql
-UPDATE inventory
-SET available = available - 1
-WHERE product_id = $1
-  AND available >= 1;
-```
-
-If one row is affected, the transaction inserts the uniquely keyed order and marks the checkout `CONFIRMED`. If zero rows are affected, it marks the checkout `SOLD_OUT`. The inventory decrement, order insert, checkout state, terminal result, and status event commit together.
-
-This prevents lost updates, negative stock, duplicate orders, and application-level `SELECT`-then-`UPDATE` races.
-
-### 9. Status delivery
-
-The browser uses `GET /api/v1/checkout-status/:trackingId` with exponential backoff and jitter. The API reads Redis first and falls back to PostgreSQL on cache miss.
-
-The optional SSE endpoint is:
-
 ```http
+GET /api/v1/checkout-status/:trackingId
 GET /api/v1/checkout-status/:trackingId/stream
+GET /api/v1/time
+GET /api/v1/admin/audit
+GET /healthz
+GET /readyz
+GET /metrics
 ```
 
-It sends cached initial state, Redis fanout events, and heartbeats. If SSE fails or is unavailable, the browser falls back to polling. Terminal states stop both mechanisms.
+`202` means the message is durably accepted by RabbitMQ. It never means that inventory has been confirmed.
 
-## State machine
+## Autoscaling and Routing
+
+`cmd/autoscaler` is a host-side Go controller for the Compose deployment. It keeps four to eight API replicas, scales up by two when CPU exceeds 50% or queue pressure crosses the configured threshold, and waits 60 seconds before scaling down. It checks Docker health and `/readyz`, writes healthy container addresses to `nginx-upstream.conf` using an atomic replacement, reloads NGINX, and drains removed replicas before stopping them.
+
+The local controller is the Compose equivalent of a production Kubernetes HPA or ECS service-autoscaling policy. Four replicas are started before the known launch. The API is stateless; checkout state is held in Redis, RabbitMQ, and PostgreSQL.
+
+## Measured Results
+
+### Load Test Method
+
+The launch test uses five Docker load-generator containers. Each generator creates 20,000 unique users and idempotency keys, opens up to 400 keep-alive connections, and starts against the same synchronized timestamp. All requests go through NGINX to the four API replicas.
+
+The generator records every request before launch and classifies every result as `202`, `429`, controlled rejection, `5xx`, timeout, connection failure, or in-flight. The launch counter is independent of response completion, so the ten-second requirement measures actual dispatch rather than worker availability. The aggregate report combines the five raw logs and separately reports accepted work, throttled traffic, failures, and silent drops.
+
+The correctness test is separate: 550 unique requests are sent against 500 units to verify exactly 500 confirmations and 50 sold-out results. The accepted-work volume is intentionally bounded by Redis admission so the test measures durable queue and worker settlement without pretending that 100,000 requests can become purchases.
+
+Together, these tests cover the launch burst, controlled admission, zero silent loss, asynchronous processing, and the 500-unit inventory invariant.
+
+### Correctness
+
+The 550-request run completed 550/550 requests with zero client failures:
 
 ```text
-QUEUED -> PROCESSING -> CONFIRMED
-                     -> SOLD_OUT
-                     -> FAILED
+CONFIRMED: 500
+SOLD_OUT:   50
+inventory:   0
+negative:    0
 ```
 
-Duplicate delivery of a terminal request is acknowledged without another inventory decrement.
+### Launch burst
 
-## Live benchmark evidence
-
-The stack was run with Docker Compose and tested through both the direct API port and the NGINX edge.
-
-### Correctness boundary test
-
-The test submitted 550 valid requests against an inventory of 500:
+The latest five-generator run used distinct source containers and sent traffic through NGINX:
 
 ```text
-confirmed orders: 500
-sold-out requests: 50
-remaining inventory: 0
-negative inventory: 0
+launched within ten seconds: 100,000
+responses completed:         100,000
+accepted with 202:             2,000
+controlled 429 responses:     98,000
+5xx, timeouts, connections:        0
+maximum launch time:            1.054 s
+maximum collection time:       19.434 s
+database: 500 CONFIRMED, 1,500 SOLD_OUT, inventory 0
 ```
 
-This proves the local run did not oversell the 500-unit inventory.
+The raw generator logs are in `outputs/benchmarks/`. Controlled `429` responses are reported separately from dropped requests; no request was silently lost.
 
-### Edge burst test
+### Frontend
 
-The load generator attempted 100,000 checkout requests through NGINX:
+The final Vite bundle is 3,876 bytes transferred in the Lighthouse runs. Three cold mobile runs using a 390x844 viewport, 4x CPU slowdown, and simulated 150 ms latency reported:
 
 ```text
-requests attempted: 100,000
-handled below 500: 520
-throttled with 429: 98,775
-failed 5xx/client failures: 705
-elapsed: 24.019 seconds
-achieved rate: 4,163.40 requests/second
+TTI: 1,189 ms, 1,185 ms, 1,190 ms
+FCP:   627 ms,   633 ms,   641 ms
 ```
 
-The result demonstrates controlled admission and separate throttling accounting. It does **not** demonstrate 10,000 requests/second on this single-replica local Compose environment. Reaching that projected target requires horizontally scaled API/NGINX capacity and a production-like load generator.
+The worst TTI is below the 1.5-second target. Raw reports are in `outputs/benchmarks/lighthouse/`.
 
-### Frontend evidence
-
-```text
-served index.html: 1,596 bytes
-HTTP status: 200
-browser navigation: 91 ms
-interactive sale state visible: within 500 ms
-```
-
-The served asset is below the 200 KB target. Local desktop smoke interaction completed below 1.5 seconds. Formal Lighthouse constrained-mobile TTI measurement: not performed.
-
-## Run locally
+## Run
 
 ```bash
 docker compose up -d --build
+docker compose up -d --scale api=4 api nginx worker
 go test ./...
 ```
 
-Open `http://localhost:8080`.
+Run the measured tests:
 
-Run the burst benchmark:
-
-```bash
-go run ./cmd/loadtest \
-  -url http://localhost:8080/api/v1/checkout \
-  -requests 100000 \
-  -duration 30s \
-  -concurrency 512
-```
-
-Inspect reconciliation data:
-
-```http
-GET http://localhost:8080/api/v1/admin/audit
+```powershell
+./scripts/distributed_load.ps1 -Generators 5 -RequestsPerGenerator 20000 -Concurrency 400 -DurationSeconds 10
+./scripts/lighthouse-mobile.ps1 -Runs 3
+go run ./cmd/autoscaler -once -dry-run
 ```
 
