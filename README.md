@@ -1,110 +1,246 @@
-# Flash Sale
+# Flash Sale System
 
-This repository implements the flash-sale take-home: 500 smartphones, a server-authoritative 8:00 PM launch, and more than 100,000 checkout attempts in the first 10 seconds. PostgreSQL is the durable authority, Redis is coordination and cache, RabbitMQ is the durable business queue, Go provides the API and workers, and NGINX is the local CDN and edge stand-in.
+## Executive summary
 
-## End-to-end flow
+This repository implements the flash-sale take-home for **500 smartphones**, launching at **8:00 PM**, with more than **100,000 checkout attempts during the launch spike**.
+
+The design separates fast request admission from durable inventory settlement:
+
+- **Go `net/http`** handles stateless HTTP requests.
+- **NGINX** serves static assets and applies edge rate limiting.
+- **Redis** performs atomic rate limiting/admission and caches status.
+- **PostgreSQL** is the only durable authority for inventory, idempotency, orders, and checkout state.
+- **RabbitMQ** is the one durable business queue.
+- **Go workers** settle inventory asynchronously.
+- **Polling** is the baseline status mechanism; **SSE** is an optional enhancement.
+
+The hard invariant is:
+
+> Confirmed orders must never exceed 500, and inventory must never become negative.
+
+## PDF requirement mapping
+
+| Requirement | Implementation | Evidence |
+|---|---|---|
+| 500 physical units | PostgreSQL inventory row seeded to 500 | Correctness run produced exactly 500 orders |
+| Launch at 8:00 PM | Server-authoritative sale timestamp | Pre-launch unit test and server-time endpoint |
+| 100,000-request spike | NGINX, Redis admission, RabbitMQ buffering, bounded workers | 100,000-request live benchmark recorded below |
+| No overselling | Atomic PostgreSQL conditional decrement | 500 confirmed, 50 sold out, stock 0 |
+| Prevent duplicate clicks | Client idempotency key plus database uniqueness | Same-key smoke test returned one tracking ID |
+| Async processing | Transactional outbox and RabbitMQ worker | Accepted requests return `202`; worker settles later |
+| Frontend responsiveness | Small static page, leading-edge button lock, polling/SSE | Served asset and browser timing measurements |
+| Rate limiting | NGINX and Redis Lua token bucket | Edge benchmark reports throttled requests separately |
+| Database consistency | ACID transaction and non-negative constraint | PostgreSQL audit query and concurrency run |
+
+## Architecture
 
 ```mermaid
 flowchart TD
-  B[Browser loads page] --> C[NGINX static assets\nCDN-ready cache headers]
-  C --> T[Fetch server time and sale start]
-  T -->|before 8:00 PM| WAIT[Display countdown\nno state mutation]
-  T -->|at or after 8:00 PM| CLICK[User clicks Buy]
-  CLICK --> KEY[Generate one Idempotency-Key\nlock button and persist in sessionStorage]
-  KEY --> EDGE[NGINX edge\nWAF/rate limit/load balance]
-  EDGE -->|over limit| R429[429 controlled response]
-  EDGE --> API[Stateless Go checkout API]
-  API --> LIVE{Server clock live?}
-  LIVE -->|no| R403[403 NOT_LIVE\nno DB Redis or queue mutation]
-  LIVE -->|yes| DB1[(PostgreSQL)]
-  DB1 --> IDEM{Existing key?}
-  IDEM -->|conflicting fingerprint| R409[409 conflict]
-  IDEM -->|existing request| EXIST[Return current tracking ID and state]
-  IDEM -->|new request| TX[Commit checkout_requests + outbox event]
-  TX --> R202[202 Accepted + tracking URL]
-  TX --> OUT[Outbox relay]
-  OUT --> Q[(RabbitMQ durable quorum queue)]
-  Q --> W[Go worker with bounded prefetch]
-  W --> CLAIM[Claim QUEUED to PROCESSING\nDB lease and token]
-  CLAIM --> INV[Atomic PostgreSQL decrement\nWHERE available > 0]
-  INV -->|one row| ORDER[Insert unique order\nmark CONFIRMED]
-  INV -->|zero rows| SOLD[Mark SOLD_OUT]
-  ORDER --> STATUS[Persist terminal status]
-  SOLD --> STATUS
-  STATUS --> CACHE[Redis status cache and fanout]
-  EXIST --> STATUSREAD[GET status]
-  R202 --> STATUSREAD
-  STATUSREAD --> CACHE
-  CACHE -->|miss| DB1
-  CACHE --> BROWSER[Browser polling with backoff\nor optional SSE]
+    Browser[Browser] -->|static assets| Edge[NGINX edge]
+    Edge -->|cache hit| Browser
+    Edge -->|POST checkout| API[Stateless Go API]
+    API --> Time{Server sale time valid?}
+    Time -->|before launch| NotLive[403 NOT_LIVE\nno mutation]
+    Time -->|live| RedisGate[Redis Lua rate limit\nand bounded admission]
+    RedisGate -->|rejected| Limited[429 Retry-After]
+    RedisGate -->|admitted| Idem[PostgreSQL atomic\nidempotency insert-or-read]
+    Idem -->|same key| Existing[Return existing state]
+    Idem -->|new key| Accepted[Commit request + outbox]
+    Accepted --> Response[202 + tracking ID]
+    Accepted --> Relay[Outbox relay]
+    Relay --> Queue[RabbitMQ durable quorum queue]
+    Queue --> Worker[Go worker\nmanual ack + bounded prefetch]
+    Worker --> Claim[DB processing lease/token]
+    Claim --> Inventory[Atomic UPDATE inventory\nWHERE available >= 1]
+    Inventory -->|one row| Confirmed[Insert unique order\nCONFIRMED]
+    Inventory -->|zero rows| SoldOut[SOLD_OUT]
+    Confirmed --> Status[Terminal status transaction]
+    SoldOut --> Status
+    Status --> Cache[Redis versioned status cache]
+    Status --> Fanout[Redis status fanout]
+    Browser -->|GET status or SSE| StatusAPI[Status API/SSE]
+    StatusAPI --> Cache
+    Cache -->|miss| PostgreSQL[(PostgreSQL)]
+    StatusAPI --> Browser
 ```
 
-## Sequential resolution of the PDF requirements
+## Sequential request flow
 
-1. **The invariant is defined first.** The sale has exactly 500 units. The only valid terminal inventory result is zero through 500 confirmed orders; inventory must never become negative. The database conditional decrement, the non-negative constraint, and the unique order constraint enforce this independently of client behavior, queue duplication, or worker count.
+### 1. Page load
 
-2. **The 8:00 PM boundary is server controlled.** The browser countdown is informational. Every checkout request is checked against `SALE_START` using server time. Before launch the API returns `403 NOT_LIVE` and does not create an idempotency row, Redis token, outbox event, or queue message. A client with a wrong clock cannot open the sale early.
+The browser requests immutable static assets through NGINX. NGINX is the local stand-in for a CDN and production WAF/load balancer. Static traffic is separated from dynamic checkout traffic and served with compression and cache headers.
 
-3. **The page is kept light.** NGINX serves the static page with compression and long-lived cache headers, representing the CDN layer required by the assignment. The sale path uses vanilla TypeScript and no framework runtime. The intended production gate is a measured bundle below 200 KB and a mobile TTI below 1.5 seconds; these are benchmark gates, not claims made from the source size alone.
+The browser calls `/api/v1/time` to obtain the server's sale timestamp. The countdown is display-only; the client clock cannot authorize a purchase.
 
-4. **The first click is made safe in the browser.** The button is disabled immediately, one UUID idempotency key is generated, and the key plus tracking ID are stored in `sessionStorage` for refresh recovery. A retry reuses the same key. The key is sent in the `Idempotency-Key` header; cookies are not the correctness mechanism.
+### 2. First click
 
-5. **The edge absorbs abusive traffic.** NGINX applies per-IP request limiting, request-size controls, compression, static caching, and proxy routing. API replicas are stateless and can be multiplied behind an active-active production load balancer. A controlled `429` is observable as throttled, not silently dropped. The local NGINX configuration is the take-home stand-in for a CDN, WAF, and managed load balancer.
+The browser immediately disables the Buy button and creates one UUID idempotency key for that logical checkout attempt. The key and tracking ID are stored in `sessionStorage` so a refresh or network retry can resume the same attempt.
 
-6. **The checkout API does no inventory work.** It validates the product, quantity, user, key, fingerprint, and sale window. A new request inserts `checkout_requests` and `outbox_events` in one PostgreSQL transaction. The API returns `202 Accepted` only after that commit, with a tracking ID and status URL. `202` means accepted for asynchronous processing, never confirmed ownership.
+The request is:
 
-7. **Idempotency survives retries.** PostgreSQL enforces unique `(user_id, idempotency_key)` and stores a request fingerprint. The same key with the same payload returns the existing state; the same key with different input returns `409`. This handles rapid clicks, timeout retries, refreshes, duplicate HTTP deliveries, and duplicate queue messages without creating a second order.
+```http
+POST /api/v1/checkout
+Idempotency-Key: <uuid>
+X-User-ID: <user>
+Content-Type: application/json
 
-8. **The transactional outbox closes the database/queue gap.** The committed request and its `CHECKOUT_REQUESTED` event cannot be split. A relay publishes pending events to RabbitMQ and marks them published after publication. Relay retries and duplicate publication are expected; the worker remains idempotent. The outbox does not itself confirm stock or provide exactly-once delivery.
-
-9. **RabbitMQ is the one durable business queue.** The queue is durable and quorum-backed, messages are persistent, consumers use manual acknowledgements and prefetch, and failures are retried. Broker capacity and worker capacity are separate: the broker absorbs bursts, while worker concurrency is capped by PostgreSQL inventory-row capacity. A worker acknowledges only after the terminal database transaction commits, so a crash before acknowledgement causes safe redelivery.
-
-10. **The worker claims ownership in PostgreSQL.** The request state is changed from `QUEUED` to `PROCESSING` with a lease/token in the durable database. Duplicate deliveries see a non-`QUEUED` state and do not process the inventory again. Redis locks are deliberately not the correctness mechanism because expiry and failover can create ownership ambiguity.
-
-11. **The inventory decision is one short ACID transaction.** The worker executes `UPDATE inventory SET available = available - 1 WHERE product_id = $1 AND available >= 1`. One affected row means insert the uniquely keyed order and mark `CONFIRMED`; zero rows means mark `SOLD_OUT`. Concurrent workers serialize on the inventory row. Deadlock, serialization, and connection failures are retryable; a committed terminal state is acknowledged exactly once from the application's point of view.
-
-12. **Status reads do not hammer PostgreSQL.** Terminal state is persisted in PostgreSQL and copied to Redis with a TTL. The status endpoint reads Redis first and falls back to PostgreSQL on a miss, so Redis restart or cache loss cannot erase the result. The baseline browser mechanism is jittered exponential polling. SSE is an optional separately scalable fanout service; it must read cached state and events rather than poll PostgreSQL once per connection.
-
-13. **The load model is explicit.** The PDF's 100,000 requests in 10 seconds is approximately 10,000 requests per second at the edge. The expected behavior is admission and throttling at NGINX, fast durable request acceptance at stateless Go replicas, queue buffering in RabbitMQ, bounded settlement in PostgreSQL, and cache-served status reads. The local benchmark reports actual results; it does not claim that a laptop equals production capacity.
-
-## Run
-
-```sh
-docker compose up --build
+{"product_id":"phone-500","quantity":1}
 ```
 
-The local edge is `http://localhost:8080`. The API returns `403 NOT_LIVE` until `SALE_START`; set it to an ISO timestamp for a test window. `POST /api/v1/checkout` requires `X-User-ID`, `Idempotency-Key`, and `{"product_id":"phone-500","quantity":1}`.
+The client never displays purchase confirmation optimistically.
 
-## Verification
+### 3. Edge admission
 
-```sh
-go test ./...
+NGINX applies request-size limits, compression, static caching, and per-IP rate limiting. Excess traffic receives a controlled `429` with `Retry-After`; it is not counted as silently dropped.
 
-# After Docker services are running, run the PDF-shaped burst test.
-go run ./cmd/loadtest -url http://localhost:8080/api/v1/checkout -requests 100000 -duration 10s -concurrency 512
+The Go API then executes Redis Lua admission logic:
+
+- token-bucket rate limit;
+- bounded short-lived admission counter;
+- TTL-based recovery after abandoned requests.
+
+Admission is not a business queue and does not confirm ownership of inventory.
+
+### 4. Sale-window enforcement
+
+The API checks server time before Redis admission and before any database mutation. A pre-launch request returns:
+
+```json
+{"status":"NOT_LIVE","sale_start":"...","server_time":"..."}
 ```
 
-The database migration enforces non-negative stock, one order per checkout request, and durable idempotency. The worker acknowledges RabbitMQ only after the terminal PostgreSQL transaction commits.
+It creates no request row, order, outbox event, queue message, Redis reservation, or inventory mutation.
 
-## Benchmark evidence
+### 5. Durable idempotency acceptance
 
-The repository contains `cmd/loadtest`, which sends the PDF-shaped burst and reports handled, throttled, failed, elapsed time, and achieved request rate.
+The API uses PostgreSQL `INSERT ... ON CONFLICT` for `(user_id, idempotency_key)`. Each request stores a fingerprint of its input.
 
-Measured local results:
+- New key: create `QUEUED` request and outbox event in one transaction.
+- Same key and same fingerprint: return the existing tracking ID/state.
+- Same key and different fingerprint: return `409 Conflict`.
+
+The API returns `202 Accepted` only after the request row and outbox row commit. `202` means accepted for asynchronous processing, not confirmed purchase.
+
+### 6. Transactional outbox and RabbitMQ
+
+The relay publishes committed outbox rows to the durable `checkout.process` quorum queue using persistent messages and publisher confirms. It marks an outbox row published only after confirmation.
+
+The system assumes at-least-once delivery. Relay retries and duplicate messages are expected; worker/database idempotency makes them safe.
+
+### 7. Worker ownership
+
+The worker claims a request using a conditional PostgreSQL update:
 
 ```text
-correctness boundary: 550 requests -> 500 CONFIRMED, 50 SOLD_OUT, 500 orders, inventory 0
-edge burst: 100000 requests, 520 handled, 98775 throttled, 705 failed, 24.019s, 4163.40 requests/s
+QUEUED -> PROCESSING
+processing_token = random token
+lease_until = now + lease duration
 ```
 
-The edge result demonstrates controlled admission and no silent loss, but it does not meet the PDF's projected 10,000 requests/s target on this local single-replica Compose setup.
+Expired leases can be reclaimed. A stale worker cannot complete a request because terminal updates verify the processing token. RabbitMQ is acknowledged only after the durable terminal transaction commits.
 
-Asset and browser smoke evidence:
+### 8. Inventory settlement
+
+The worker runs one short PostgreSQL transaction:
+
+```sql
+UPDATE inventory
+SET available = available - 1
+WHERE product_id = $1
+  AND available >= 1;
+```
+
+If one row is affected, the transaction inserts the uniquely keyed order and marks the checkout `CONFIRMED`. If zero rows are affected, it marks the checkout `SOLD_OUT`. The inventory decrement, order insert, checkout state, terminal result, and status event commit together.
+
+This prevents lost updates, negative stock, duplicate orders, and application-level `SELECT`-then-`UPDATE` races.
+
+### 9. Status delivery
+
+The browser uses `GET /api/v1/checkout-status/:trackingId` with exponential backoff and jitter. The API reads Redis first and falls back to PostgreSQL on cache miss.
+
+The optional SSE endpoint is:
+
+```http
+GET /api/v1/checkout-status/:trackingId/stream
+```
+
+It sends cached initial state, Redis fanout events, and heartbeats. If SSE fails or is unavailable, the browser falls back to polling. Terminal states stop both mechanisms.
+
+## State machine
 
 ```text
-served index.html: 1,596 bytes, HTTP 200
+QUEUED -> PROCESSING -> CONFIRMED
+                     -> SOLD_OUT
+                     -> FAILED
+```
+
+Duplicate delivery of a terminal request is acknowledged without another inventory decrement.
+
+## Live benchmark evidence
+
+The stack was run with Docker Compose and tested through both the direct API port and the NGINX edge.
+
+### Correctness boundary test
+
+The test submitted 550 valid requests against an inventory of 500:
+
+```text
+confirmed orders: 500
+sold-out requests: 50
+remaining inventory: 0
+negative inventory: 0
+```
+
+This proves the local run did not oversell the 500-unit inventory.
+
+### Edge burst test
+
+The load generator attempted 100,000 checkout requests through NGINX:
+
+```text
+requests attempted: 100,000
+handled below 500: 520
+throttled with 429: 98,775
+failed 5xx/client failures: 705
+elapsed: 24.019 seconds
+achieved rate: 4,163.40 requests/second
+```
+
+The result demonstrates controlled admission and separate throttling accounting. It does **not** demonstrate 10,000 requests/second on this single-replica local Compose environment. Reaching that projected target requires horizontally scaled API/NGINX capacity and a production-like load generator.
+
+### Frontend evidence
+
+```text
+served index.html: 1,596 bytes
+HTTP status: 200
 browser navigation: 91 ms
-interactive sale state visible: within 500 ms after navigation
+interactive sale state visible: within 500 ms
 ```
 
-The served asset is below the 200 KB target and the observed local interaction is below 1.5 seconds. This is a desktop smoke measurement, not formal Lighthouse constrained-mobile certification.
+The served asset is below the 200 KB target. Local desktop smoke interaction completed below 1.5 seconds. Formal Lighthouse constrained-mobile TTI measurement: not performed.
+
+## Run locally
+
+```bash
+docker compose up -d --build
+go test ./...
+```
+
+Open `http://localhost:8080`.
+
+Run the burst benchmark:
+
+```bash
+go run ./cmd/loadtest \
+  -url http://localhost:8080/api/v1/checkout \
+  -requests 100000 \
+  -duration 30s \
+  -concurrency 512
+```
+
+Inspect reconciliation data:
+
+```http
+GET http://localhost:8080/api/v1/admin/audit
+```
+
