@@ -69,8 +69,6 @@ flowchart TD
 
 ## Run
 
-## Run
-
 ```sh
 docker compose up --build
 ```
@@ -91,4 +89,3 @@ The database migration enforces non-negative stock, one order per checkout reque
 ## Benchmark evidence
 
 The repository now contains `cmd/loadtest`, which sends 100,000 requests over a 10-second window and reports served, throttled, failed, elapsed time, and achieved request rate. On this run, Docker Desktop was unavailable, so the services could not be started and no valid end-to-end throughput number was measured. The 10,000 RPS figure therefore remains the assignment target, not a claimed local result. Run the command above on a machine with Docker running and record its output here before claiming the target is achieved.
-

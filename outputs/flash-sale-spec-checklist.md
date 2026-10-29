@@ -418,3 +418,9 @@ Redis Streams remains a valid alternative, but it couples the queue failure doma
 - [x] Frontend source and static distributable implement first-click locking, session recovery, server-synchronized countdown, submission-only optimistic UI, and jittered polling.
 - [x] Local edge config implements static serving, compression, cache headers, request rate limiting, and API proxying.
 - [x] `go test ./...` passes for both Go commands; integration/load tests remain required before marking the corresponding gates above complete.
+- [x] Redis Lua token-bucket and bounded-admission paths are implemented in the API; integration evidence is still required.
+- [x] Atomic PostgreSQL idempotency insert-or-read path is implemented with fingerprint conflict detection.
+- [x] Worker processing leases, tokens, expiry recovery, RabbitMQ publisher confirms, quorum queue, and dead-letter queue configuration are implemented.
+- [x] Versioned status cache updates, Redis fanout publication, SSE heartbeats, and polling fallback are implemented.
+- [x] Admin audit endpoint is implemented at `/api/v1/admin/audit`.
+- [x] Unit coverage verifies pre-launch checkout returns `NOT_LIVE` before any persistence path.

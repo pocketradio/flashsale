@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 	"log"
 	"os"
 	"time"
@@ -18,6 +23,8 @@ func main() {
 	ctx := context.Background()
 	db, _ := pgxpool.New(ctx, env("DATABASE_URL", "postgres://flash:flash@postgres:5432/flashsale?sslmode=disable"))
 	defer db.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: env("REDIS_ADDR", "redis:6379")})
+	defer rdb.Close()
 	conn, err := amqp091.Dial(env("RABBITMQ_URL", "amqp://flash:flash@rabbitmq:5672/"))
 	if err != nil {
 		log.Fatal(err)
@@ -25,9 +32,14 @@ func main() {
 	defer conn.Close()
 	ch, _ := conn.Channel()
 	defer ch.Close()
-	ch.QueueDeclare("checkout.process", true, false, false, false, amqp091.Table{"x-queue-type": "quorum"})
+	ch.ExchangeDeclare("checkout.dlx", "direct", true, false, false, false, nil)
+	ch.QueueDeclare("checkout.dead", true, false, false, false, amqp091.Table{"x-queue-type": "quorum"})
+	ch.QueueBind("checkout.dead", "checkout.process", "checkout.dlx", false, nil)
+	ch.QueueDeclare("checkout.process", true, false, false, false, amqp091.Table{"x-queue-type": "quorum", "x-dead-letter-exchange": "checkout.dlx"})
+	ch.Confirm(false)
+	confirms := ch.NotifyPublish(make(chan amqp091.Confirmation, 128))
 	ch.Qos(8, 0, false)
-	go relay(ctx, db, ch)
+	go relay(ctx, db, ch, confirms)
 	msgs, err := ch.Consume("checkout.process", "worker", false, false, false, false, nil)
 	if err != nil {
 		log.Fatal(err)
@@ -42,11 +54,21 @@ func main() {
 			log.Printf("job %s: %v", j.TrackingID, err)
 			m.Nack(false, true)
 		} else {
+			syncStatus(ctx, db, rdb, j.TrackingID)
 			m.Ack(false)
 		}
 	}
 }
-func relay(ctx context.Context, db *pgxpool.Pool, ch *amqp091.Channel) {
+func syncStatus(ctx context.Context, db *pgxpool.Pool, rdb *redis.Client, id string) {
+	var status, result string
+	var version int64
+	if db.QueryRow(ctx, `SELECT status,COALESCE(terminal_result,''),status_version FROM checkout_requests WHERE id=$1`, id).Scan(&status, &result, &version) == nil {
+		b, _ := json.Marshal(map[string]any{"tracking_id": id, "status": status, "result": result, "version": version})
+		rdb.Set(ctx, "checkout:status:"+id, b, 10*time.Minute)
+		rdb.Publish(ctx, "checkout:events:"+id, b)
+	}
+}
+func relay(ctx context.Context, db *pgxpool.Pool, ch *amqp091.Channel, confirms <-chan amqp091.Confirmation) {
 	for {
 		rows, err := db.Query(ctx, `SELECT id,aggregate_id FROM outbox_events WHERE published_at IS NULL ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 50`)
 		if err == nil {
@@ -56,6 +78,10 @@ func relay(ctx context.Context, db *pgxpool.Pool, ch *amqp091.Channel) {
 				rows.Scan(&eid, &aid)
 				body, _ := json.Marshal(job{TrackingID: aid})
 				if ch.PublishWithContext(ctx, "", "checkout.process", false, false, amqp091.Publishing{DeliveryMode: amqp091.Persistent, ContentType: "application/json", Body: body}) == nil {
+					confirmed := <-confirms
+					if !confirmed.Ack {
+						continue
+					}
 					db.Exec(ctx, `UPDATE outbox_events SET published_at=now(),attempts=attempts+1 WHERE id=$1`, eid)
 				}
 			}
@@ -70,29 +96,37 @@ func process(ctx context.Context, db *pgxpool.Pool, id string) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	var product string
-	var qty int
-	var status string
-	if err = tx.QueryRow(ctx, `SELECT product_id,quantity,status FROM checkout_requests WHERE id=$1 FOR UPDATE`, id).Scan(&product, &qty, &status); err != nil {
+	tokenBytes := make([]byte, 16)
+	if _, err = rand.Read(tokenBytes); err != nil {
 		return err
 	}
-	if status != "QUEUED" {
+	token := hex.EncodeToString(tokenBytes)
+	var product string
+	var qty int
+	err = tx.QueryRow(ctx, `UPDATE checkout_requests SET status='PROCESSING',processing_token=$2,lease_until=now()+interval '30 seconds',updated_at=now() WHERE id=$1 AND (status='QUEUED' OR (status='PROCESSING' AND lease_until<now())) RETURNING product_id,quantity`, id, token).Scan(&product, &qty)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
 	}
 	var n int
 	if err = tx.QueryRow(ctx, `UPDATE inventory SET available=available-1 WHERE product_id=$1 AND available>=1 RETURNING available`, product).Scan(&n); err != nil {
 		if err.Error() == "no rows in result set" {
-			_, err = tx.Exec(ctx, `UPDATE checkout_requests SET status='SOLD_OUT',terminal_result='sold out',updated_at=now() WHERE id=$1`, id)
+			_, err = tx.Exec(ctx, `UPDATE checkout_requests SET status='SOLD_OUT',terminal_result='sold out',status_version=status_version+1,processing_token=NULL,lease_until=NULL,updated_at=now() WHERE id=$1 AND processing_token=$2`, id, token)
 		} else {
 			return err
 		}
 	} else {
 		_, err = tx.Exec(ctx, `INSERT INTO orders(checkout_request_id,product_id,quantity) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, id, product, qty)
 		if err == nil {
-			_, err = tx.Exec(ctx, `UPDATE checkout_requests SET status='CONFIRMED',terminal_result='confirmed',updated_at=now() WHERE id=$1`, id)
+			_, err = tx.Exec(ctx, `UPDATE checkout_requests SET status='CONFIRMED',terminal_result='confirmed',status_version=status_version+1,processing_token=NULL,lease_until=NULL,updated_at=now() WHERE id=$1 AND processing_token=$2`, id, token)
 		}
 	}
 	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(event_type,aggregate_id,payload) VALUES('CHECKOUT_STATUS_UPDATED',$1,$2)`, id, []byte(`{"tracking_id":"`+id+`"}`)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
