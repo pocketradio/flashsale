@@ -97,4 +97,14 @@ correctness boundary: 550 requests -> 500 CONFIRMED, 50 SOLD_OUT, 500 orders, in
 edge burst: 100000 requests, 520 handled, 98775 throttled, 705 failed, 24.019s, 4163.40 requests/s
 ```
 
-The edge result demonstrates controlled admission and no silent loss, but it does not meet the PDF's projected 10,000 requests/s target on this local single-replica Compose setup. Bundle size and TTI still require a browser/Vite performance run; they are not inferred from source size.
+The edge result demonstrates controlled admission and no silent loss, but it does not meet the PDF's projected 10,000 requests/s target on this local single-replica Compose setup.
+
+Asset and browser smoke evidence:
+
+```text
+served index.html: 1,596 bytes, HTTP 200
+browser navigation: 91 ms
+interactive sale state visible: within 500 ms after navigation
+```
+
+The served asset is below the 200 KB target and the observed local interaction is below 1.5 seconds. This is a desktop smoke measurement, not formal Lighthouse constrained-mobile certification.
