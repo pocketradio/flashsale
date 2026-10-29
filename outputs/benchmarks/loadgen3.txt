@@ -1,1 +1,1 @@
-status=PASS generator=gen3 requested=20000 launched=20000 completed=20000 accepted_202=401 throttled_429=19599 controlled_lt500=0 failed=0 timeouts=0 connection_failures=0 in_flight=0 launch_elapsed=879ms total_elapsed=17.359s launch_rps=22752.03 completion_rps=1152.11
+status=PASS generator=gen3 requested=20000 launched=20000 completed=20000 accepted_202=20000 throttled_429=0 controlled_lt500=0 failed=0 timeouts=0 connection_failures=0 in_flight=0 launch_elapsed=4.011s total_elapsed=1m5.621s launch_rps=4986.02 completion_rps=304.78
