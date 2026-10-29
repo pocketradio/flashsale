@@ -431,8 +431,8 @@ Redis Streams remains a valid alternative, but it couples the queue failure doma
 - [x] Unit coverage verifies pre-launch checkout returns `NOT_LIVE` before any persistence path.
 - [x] Live Compose correctness run produced exactly 500 confirmed orders from 550 requests, 50 sold-out results, and zero negative stock.
 - [x] Repeated correctness run after autoscaling changes completed 550/550 requests with 0 client failures, 500 confirmed, 50 sold out, and stock 0 using bounded client concurrency.
-- [x] Distributed four-replica edge run launched and completed 100,000 unique requests, with 2,000 accepted, 98,000 controlled throttles, zero failures, and 500 confirmed orders with inventory 0.
-- [x] The PDF launch burst was dispatched within ten seconds; latest run launched and completed 100,000 requests with zero failures, 2,000 accepted and 98,000 controlled throttles; maximum launch time was 1.054 seconds.
+- [x] Distributed four-replica edge run launched and completed 100,000 unique requests, with 100,000 accepted, zero controlled throttles, zero failures, and 500 confirmed orders with inventory 0 after queue drain.
+- [x] The PDF launch burst was dispatched within ten seconds; latest run launched and completed 100,000 requests with zero failures, 100,000 accepted and zero controlled throttles; maximum launch time was 4.289 seconds and maximum response collection time was 65.648 seconds.
 - [x] Raw per-generator launch logs are preserved under `outputs/benchmarks/`; each generator launched 20,000 of 20,000 requests within the ten-second window.
 - [x] Sustained 10,000-response-per-second completion is explicitly classified as outside the PDF acceptance target; the measured PDF launch-burst target passed.
 - [x] Live NGINX served `index.html` at 1,596 bytes with HTTP 200.
