@@ -10,7 +10,7 @@ This repository implements a flash-sale checkout system:
 - Inventory cannot become negative.
 - Accepted checkout requests are durable and idempotent.
 
-The local deployment launched 100,000 requests through NGINX, accepted 2,000, throttled 98,000 with controlled `429` responses, produced no connection or server failures, and confirmed exactly 500 orders.
+The local deployment launched 100,000 requests through NGINX, accepted all 100,000 with publisher-confirmed `202` responses, produced no throttles or transport/server failures, and settled exactly 500 orders as confirmed.
 
 ## Contents
 
@@ -139,7 +139,7 @@ The launch test uses five Docker load-generator containers. Each generator creat
 
 The generator records every request before launch and classifies every result as `202`, `429`, controlled rejection, `5xx`, timeout, connection failure, or in-flight. The launch counter is independent of response completion, so the ten-second requirement measures actual dispatch rather than worker availability. The aggregate report combines the five raw logs and separately reports accepted work, throttled traffic, failures, and silent drops.
 
-The correctness test is separate: 550 unique requests are sent against 500 units to verify exactly 500 confirmations and 50 sold-out results. The accepted-work volume is intentionally bounded by Redis admission so the test measures durable queue and worker settlement without pretending that 100,000 requests can become purchases.
+The correctness test is separate: 550 unique requests are sent against 500 units to verify exactly 500 confirmations and 50 sold-out results. The launch profile has no artificial 2,000-request global cap; all valid burst requests are admitted to RabbitMQ, while inventory settlement still limits confirmations to 500.
 
 Together, these tests cover the launch burst, controlled admission, zero silent loss, asynchronous processing, and the 500-unit inventory invariant.
 
@@ -161,15 +161,15 @@ The latest five-generator run used distinct source containers and sent traffic t
 ```text
 launched within ten seconds: 100,000
 responses completed:         100,000
-accepted with 202:             2,000
-controlled 429 responses:     98,000
-5xx, timeouts, connections:        0
-maximum launch time:            1.054 s
-maximum collection time:       19.434 s
-database: 500 CONFIRMED, 1,500 SOLD_OUT, inventory 0
+accepted with 202:           100,000
+controlled 429 responses:          0
+5xx, timeouts, connections:       0
+maximum launch time:            4.289 s
+maximum collection time:       65.648 s
+database after queue drain: 500 CONFIRMED, 99,500 SOLD_OUT, inventory 0
 ```
 
-The raw generator logs are in `outputs/benchmarks/`. Controlled `429` responses are reported separately from dropped requests; no request was silently lost.
+The raw generator logs are in `outputs/benchmarks/`. The launch window measures dispatch; response collection continues while RabbitMQ publisher confirms and the API completes the accepted work. No request was silently lost.
 
 ### Frontend
 
