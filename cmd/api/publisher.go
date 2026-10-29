@@ -6,7 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rabbitmq/amqp091-go"
@@ -24,52 +27,40 @@ type job struct {
 
 type publisher struct {
 	conn     *amqp091.Connection
-	ch       *amqp091.Channel
-	confirms <-chan amqp091.Confirmation
-	mu       sync.Mutex
+	slots    []*publisherSlot
+	next     atomic.Uint32
 }
+
+type publisherSlot struct { ch *amqp091.Channel; confirms <-chan amqp091.Confirmation; mu sync.Mutex }
 
 func newPublisher(url string) (*publisher, error) {
 	conn, err := amqp091.Dial(url)
 	if err != nil {
 		return nil, err
 	}
-	ch, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		return nil, err
+	p := &publisher{conn: conn}
+	channels := 8
+	if v, e := strconv.Atoi(os.Getenv("PUBLISHER_CHANNELS")); e == nil && v > 0 { channels = v }
+	for i := 0; i < channels; i++ {
+		ch, e := conn.Channel(); if e != nil { p.close(); return nil, e }
+		if e = ch.ExchangeDeclare("checkout.dlx", "direct", true, false, false, false, nil); e != nil { ch.Close(); p.close(); return nil, e }
+		if _, e = ch.QueueDeclare("checkout.dead", true, false, false, false, amqp091.Table{"x-queue-type": "quorum"}); e != nil { ch.Close(); p.close(); return nil, e }
+		if _, e = ch.QueueDeclare("checkout.process", true, false, false, false, amqp091.Table{"x-queue-type": "quorum", "x-dead-letter-exchange": "checkout.dlx"}); e != nil { ch.Close(); p.close(); return nil, e }
+		if e = ch.Confirm(false); e != nil { ch.Close(); p.close(); return nil, e }
+		p.slots = append(p.slots, &publisherSlot{ch: ch, confirms: ch.NotifyPublish(make(chan amqp091.Confirmation, 1024))})
 	}
-	if err = ch.ExchangeDeclare("checkout.dlx", "direct", true, false, false, false, nil); err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, err
-	}
-	if _, err = ch.QueueDeclare("checkout.dead", true, false, false, false, amqp091.Table{"x-queue-type": "quorum"}); err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, err
-	}
-	if _, err = ch.QueueDeclare("checkout.process", true, false, false, false, amqp091.Table{"x-queue-type": "quorum", "x-dead-letter-exchange": "checkout.dlx"}); err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, err
-	}
-	if err = ch.Confirm(false); err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, err
-	}
-	return &publisher{conn: conn, ch: ch, confirms: ch.NotifyPublish(make(chan amqp091.Confirmation, 1024))}, nil
+	return p, nil
 }
 
 func (p *publisher) publish(ctx context.Context, body []byte) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.ch.PublishWithContext(ctx, "", "checkout.process", false, false, amqp091.Publishing{DeliveryMode: amqp091.Persistent, ContentType: "application/json", Body: body}); err != nil {
+	if len(p.slots) == 0 { return errors.New("no publisher channels") }
+	s := p.slots[int(p.next.Add(1))%len(p.slots)]
+	s.mu.Lock(); defer s.mu.Unlock()
+	if err := s.ch.PublishWithContext(ctx, "", "checkout.process", false, false, amqp091.Publishing{DeliveryMode: amqp091.Persistent, ContentType: "application/json", Body: body}); err != nil {
 		return err
 	}
 	select {
-	case c, ok := <-p.confirms:
+	case c, ok := <-s.confirms:
 		if !ok || !c.Ack {
 			return errors.New("rabbitmq publish was not confirmed")
 		}
@@ -80,8 +71,7 @@ func (p *publisher) publish(ctx context.Context, body []byte) error {
 }
 
 func (p *publisher) close() {
-	if p.ch != nil {
-		p.ch.Close()
+	for _, s := range p.slots { if s != nil && s.ch != nil { _ = s.ch.Close() }
 	}
 	if p.conn != nil {
 		p.conn.Close()
