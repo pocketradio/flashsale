@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -28,6 +29,7 @@ type server struct {
 type checkoutRequest struct {
 	ProductID string `json:"product_id"`
 	Quantity  int    `json:"quantity"`
+	ClientRef string `json:"client_ref,omitempty"`
 }
 type response struct {
 	TrackingID string `json:"tracking_id,omitempty"`
@@ -52,9 +54,7 @@ func main() {
 	defer db.Close()
 	rdb := redis.NewClient(&redis.Options{Addr: env("REDIS_ADDR", "redis:6379")})
 	start, err := loadSaleStart(ctx, db)
-	if err != nil {
-		start, _ = time.Parse(time.RFC3339, env("SALE_START", time.Now().UTC().Format(time.RFC3339)))
-	}
+	if err != nil || start.IsZero() { start, _ = time.Parse(time.RFC3339, env("SALE_START", time.Now().UTC().Format(time.RFC3339))) }
 	s := &server{db: db, rdb: rdb, saleStart: start, productID: env("PRODUCT_ID", "phone-500")}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
@@ -140,7 +140,7 @@ func (s *server) checkout(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(response{Status: "FAILED", Error: "unknown product"})
 		return
 	}
-	fp := sha256.Sum256([]byte(in.ProductID + ":" + strconv.Itoa(in.Quantity)))
+	fp := sha256.Sum256([]byte(in.ProductID + ":" + strconv.Itoa(in.Quantity) + ":" + in.ClientRef))
 	fingerprint := hex.EncodeToString(fp[:])
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
@@ -211,6 +211,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) admit(ctx context.Context, user, remote string) (bool, error) {
+	if host, _, err := net.SplitHostPort(remote); err == nil { remote = host }
 	key := "flash:rate:" + strings.ReplaceAll(remote, ":", "_")
 	ok, err := s.rdb.Eval(ctx, rateLimitLua, []string{key}, time.Now().UnixMilli(), 20.0/1000.0, 40).Int()
 	if err != nil {

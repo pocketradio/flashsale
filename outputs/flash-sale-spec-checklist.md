@@ -424,3 +424,7 @@ Redis Streams remains a valid alternative, but it couples the queue failure doma
 - [x] Versioned status cache updates, Redis fanout publication, SSE heartbeats, and polling fallback are implemented.
 - [x] Admin audit endpoint is implemented at `/api/v1/admin/audit`.
 - [x] Unit coverage verifies pre-launch checkout returns `NOT_LIVE` before any persistence path.
+- [x] Live Compose correctness run produced exactly 500 confirmed orders from 550 requests, 50 sold-out results, and zero negative stock.
+- [x] Live edge burst attempted 100,000 requests and recorded 520 handled, 98,775 throttled, 705 failed, and 4,163.40 requests/s over 24.019 seconds.
+- [ ] The live edge benchmark reaches the PDF's projected 10,000 requests/s target; the single-replica local result is below target and requires horizontal scaling/configuration work.
+- [ ] Browser/Vite bundle-size and constrained-mobile TTI measurements are still outstanding.

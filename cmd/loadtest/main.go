@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,7 @@ func main() {
 	n := flag.Int("requests", 100000, "requests to send")
 	d := flag.Duration("duration", 10*time.Second, "load window")
 	concurrency := flag.Int("concurrency", 512, "concurrent clients")
+	pace := flag.Duration("pace", 0, "optional delay after each request")
 	flag.Parse()
 	client := &http.Client{Timeout: 15 * time.Second}
 	ctx, cancel := context.WithTimeout(context.Background(), *d+20*time.Second)
@@ -28,11 +30,10 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for range jobs {
-				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, *url, nil)
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, *url, strings.NewReader(`{"product_id":"phone-500","quantity":1}`))
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("X-User-ID", fmt.Sprintf("load-user-%d", time.Now().UnixNano()))
 				req.Header.Set("Idempotency-Key", fmt.Sprintf("load-%d", time.Now().UnixNano()))
-				req.Body = http.NoBody
 				atomic.AddInt64(&sent, 1)
 				resp, err := client.Do(req)
 				if err != nil {
@@ -47,6 +48,9 @@ func main() {
 					atomic.AddInt64(&failed, 1)
 				}
 				resp.Body.Close()
+				if *pace > 0 {
+					time.Sleep(*pace)
+				}
 			}
 		}()
 	}
@@ -62,4 +66,3 @@ func main() {
 	elapsed := time.Since(start)
 	fmt.Printf("requests=%d ok_or_client_handled=%d throttled=%d failed=%d elapsed=%s achieved_rps=%.2f\n", sent, ok, throttled, failed, elapsed.Round(time.Millisecond), float64(sent)/elapsed.Seconds())
 }
-
