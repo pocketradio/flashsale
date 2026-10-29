@@ -3,7 +3,7 @@ param(
   [int]$RequestsPerGenerator = 20000,
   [int]$Concurrency = 400,
   [int]$DurationSeconds = 10,
-  [int]$RequestTimeoutSeconds = 30
+  [int]$RequestTimeoutSeconds = 180
 )
 
 $ErrorActionPreference = 'Stop'
