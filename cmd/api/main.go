@@ -271,7 +271,9 @@ func (s *server) admit(ctx context.Context, user, remote, idemKey, fingerprint, 
 	}
 	rateKey := "flash:rate:" + strings.ReplaceAll(remote, ":", "_")
 	rateRPS, _ := strconv.ParseFloat(env("CHECKOUT_RATE_RPS", "20"), 64)
-	res, err := s.rdb.Eval(ctx, admissionLua, []string{rateKey, "flash:admission", "flash:idem:" + user + ":" + idemKey, "flash:ticket:" + id}, s.saleStart.UnixMilli(), rateRPS/1000.0, int(rateRPS*2), 2000, fingerprint, id, 30).StringSlice()
+	capacity, _ := strconv.Atoi(env("ADMISSION_CAPACITY", "100000"))
+	if capacity < 1 { capacity = 100000 }
+	res, err := s.rdb.Eval(ctx, admissionLua, []string{rateKey, "flash:admission", "flash:idem:" + user + ":" + idemKey, "flash:ticket:" + id}, s.saleStart.UnixMilli(), rateRPS/1000.0, int(rateRPS*2), capacity, fingerprint, id, 30).StringSlice()
 	if err != nil {
 		return 0, "", err
 	}
