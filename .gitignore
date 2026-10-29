@@ -1,0 +1,5 @@
+.gomodcache/
+.gopath/
+work/
+*.log
+frontend/node_modules/
