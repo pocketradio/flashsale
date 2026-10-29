@@ -1,0 +1,1 @@
+{"scripts":{"build":"vite build"},"devDependencies":{"@vitejs/plugin-basic-ssl":"latest","typescript":"latest","vite":"latest"},"dependencies":{}}
