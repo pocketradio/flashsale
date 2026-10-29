@@ -427,4 +427,6 @@ Redis Streams remains a valid alternative, but it couples the queue failure doma
 - [x] Live Compose correctness run produced exactly 500 confirmed orders from 550 requests, 50 sold-out results, and zero negative stock.
 - [x] Live edge burst attempted 100,000 requests and recorded 520 handled, 98,775 throttled, 705 failed, and 4,163.40 requests/s over 24.019 seconds.
 - [ ] The live edge benchmark reaches the PDF's projected 10,000 requests/s target; the single-replica local result is below target and requires horizontal scaling/configuration work.
-- [ ] Browser/Vite bundle-size and constrained-mobile TTI measurements are still outstanding.
+- [x] Live NGINX served `index.html` at 1,596 bytes with HTTP 200.
+- [x] Browser smoke navigation completed in 91 ms and the interactive sale state was visible within 500 ms.
+- [ ] Formal Lighthouse constrained-mobile TTI evidence remains outstanding; the local desktop smoke result is below 1.5 seconds but is not equivalent certification.
